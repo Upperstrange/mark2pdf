@@ -1,3 +1,4 @@
+
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
@@ -56,21 +57,22 @@ export default function Home() {
       // Replace display math $$...$$
       content = content.replace(/\$\$([\s\S]*?)\$\$/g, (match, math) => {
         try {
-          return katex.renderToString(math, { displayMode: true, throwOnError: false });
+          return katex.renderToString(math, { displayMode: true, throwOnError: false, trust: true });
         } catch (e) {
           console.error("KaTeX display error:", e);
           return `<span class="text-destructive">Error rendering: ${math}</span>`;
         }
       });
       // Replace inline math $...$
-      content = content.replace(/\$([\s\S]*?)\$/g, (match, math) => {
-        // Avoid rendering $ in code blocks or already rendered math
-        if (match.startsWith('$$') || match.endsWith('$$')) return match;
+      content = content.replace(/(^|[^\\])\$(.+?)\$/g, (match, prefix, math) => {
+        // Avoid rendering $ in code blocks or already rendered math by looking at prefix
+        // This regex is basic, for more complex scenarios a proper AST parser or marked extension would be better.
+        if (match.startsWith('$$') || match.endsWith('$$') ) return match; // Avoid processing parts of display math
         try {
-          return katex.renderToString(math, { displayMode: false, throwOnError: false });
+          return prefix + katex.renderToString(math, { displayMode: false, throwOnError: false, trust: true });
         } catch (e) {
           console.error("KaTeX inline error:", e);
-          return `<span class="text-destructive">Error rendering: ${math}</span>`;
+          return prefix + `<span class="text-destructive">Error rendering: ${math}</span>`;
         }
       });
       return content;
@@ -96,55 +98,83 @@ export default function Home() {
     });
 
     try {
-      // Ensure KaTeX fonts are loaded before rendering
-      await new Promise(resolve => setTimeout(resolve, 500)); // Small delay for fonts
+      let katexCSS = '';
+      try {
+        // Attempt to find and fetch KaTeX CSS. This relies on Next.js outputting katex.min.css
+        // or a bundle containing its name in a predictable way.
+        const katexLink = document.querySelector<HTMLLinkElement>('link[href*="katex.min.css"], link[href*="katex"]');
+        if (katexLink?.href) {
+          const response = await fetch(katexLink.href);
+          if (response.ok) {
+            katexCSS = await response.text();
+          } else {
+            console.warn(`Failed to fetch KaTeX CSS from ${katexLink.href}. Status: ${response.status}. PDF fonts might be affected.`);
+          }
+        } else {
+           console.warn('KaTeX CSS link tag not found. PDF fonts might be affected.');
+        }
+      } catch (e) {
+        console.warn('Error fetching or processing KaTeX CSS:', e);
+      }
 
       const canvas = await html2canvas(printableAreaRef.current, {
-        scale: 2, // Increase scale for better quality
-        useCORS: true, // If you have external images
-        logging: false,
-        onclone: (document) => {
-          // Apply styles to ensure KaTeX fonts are embedded or rendered correctly
-          const katexStylesheets = Array.from(document.head.querySelectorAll('link[href*="katex"]'));
-          katexStylesheets.forEach(link => {
-            // For simplicity, we'll assume styles are loaded. 
-            // In a complex scenario, you might fetch and inline them.
-          });
-        }
+        scale: 2, // Improves resolution
+        useCORS: true, 
+        logging: false, 
+        onclone: (clonedDoc) => {
+          if (katexCSS) {
+            const style = clonedDoc.createElement('style');
+            style.textContent = katexCSS;
+            clonedDoc.head.appendChild(style);
+          }
+          // Additional measure: Ensure all images in the cloned document are loaded.
+          // html2canvas typically waits for images, but this can be a fallback.
+          const images = clonedDoc.getElementsByTagName('img');
+          const imagePromises = [];
+          for (let i = 0; i < images.length; i++) {
+            if (!images[i].complete) {
+              imagePromises.push(new Promise(resolve => {
+                images[i].onload = images[i].onerror = resolve;
+              }));
+            }
+          }
+          return Promise.all(imagePromises);
+        },
       });
       
       const imgData = canvas.toDataURL('image/png');
       const pdf = new jsPDF({
         orientation: 'portrait',
-        unit: 'pt', // Use points for better consistency with HTML/CSS
+        unit: 'pt', // Use points for better consistency
         format: 'a4',
       });
 
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = pdf.internal.pageSize.getHeight();
+      
+      const margin = 40; // 40 points margin (approx 0.55 inches)
+      const contentAreaWidth = pdfWidth - 2 * margin;
+      const contentAreaHeight = pdfHeight - 2 * margin;
+
       const imgProps = pdf.getImageProperties(imgData);
-      const imgWidth = imgProps.width;
-      const imgHeight = imgProps.height;
+      const imgOriginalWidth = imgProps.width; // Pixel width of the canvas image
+      const imgOriginalHeight = imgProps.height; // Pixel height of the canvas image
+      const imgAspectRatio = imgOriginalWidth / imgOriginalHeight;
 
-      // Calculate scaling factor to fit image within A4, maintaining aspect ratio
-      const ratio = Math.min(pdfWidth / imgWidth, pdfHeight / imgHeight);
+      // Calculate dimensions of the image in PDF points, fitting contentArea
+      let pdfImgWidth = contentAreaWidth; // Assume it's limited by width
+      let pdfImgHeight = pdfImgWidth / imgAspectRatio;
+
+      if (pdfImgHeight > contentAreaHeight) { // If that makes height too large, it's limited by height
+        pdfImgHeight = contentAreaHeight;
+        pdfImgWidth = pdfImgHeight * imgAspectRatio;
+      }
       
-      const scaledWidth = imgWidth * ratio;
-      const scaledHeight = imgHeight * ratio;
-
-      // Center the image on the page
-      const x = (pdfWidth - scaledWidth) / 2;
-      const y = (pdfHeight - scaledHeight) / 2;
+      // Center the image within the content area (which starts at margin, margin)
+      const x = margin + (contentAreaWidth - pdfImgWidth) / 2;
+      const y = margin + (contentAreaHeight - pdfImgHeight) / 2;
       
-      // Add a small margin if content is smaller than page.
-      const margin = 20; // points
-      const finalX = Math.max(x, margin);
-      const finalY = Math.max(y, margin);
-      const finalWidth = Math.min(scaledWidth, pdfWidth - 2 * margin);
-      const finalHeight = Math.min(scaledHeight, pdfHeight - 2 * margin);
-
-
-      pdf.addImage(imgData, 'PNG', finalX, finalY, finalWidth, finalHeight);
+      pdf.addImage(imgData, 'PNG', x, y, pdfImgWidth, pdfImgHeight);
       pdf.save('mark2pdf_document.pdf');
       
       toast({
@@ -153,9 +183,10 @@ export default function Home() {
       });
     } catch (error) {
       console.error("Error generating PDF:", error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       toast({
         title: "PDF Generation Failed",
-        description: "An error occurred while generating the PDF. Please check console for details.",
+        description: `An error occurred: ${errorMessage}. Check console for details.`,
         variant: "destructive",
       });
     }
@@ -176,7 +207,7 @@ export default function Home() {
             placeholder="Type your Markdown here..."
             value={markdown}
             onChange={(e) => setMarkdown(e.target.value)}
-            className="min-h-[300px] text-base rounded-md shadow-sm focus:ring-primary focus:border-primary"
+            className="min-h-[300px] text-base rounded-md shadow-sm focus:ring-primary focus:border-primary font-mono"
             aria-label="Markdown Input Area"
           />
         </CardContent>
@@ -216,13 +247,19 @@ export default function Home() {
         </CardContent>
       </Card>
 
-      {/* Hidden div for PDF generation */}
-      <div id="printableArea" ref={printableAreaRef} className="absolute -left-[9999px] top-auto w-[794px] p-8 bg-white text-black">
+      {/* Hidden div for PDF generation. Styled to match A4 paper aspect ratio at 96 DPI (794x1123px). */}
+      {/* Width is 794px. Height will be auto based on content. Padding is applied internally. */}
+      <div 
+        id="printableArea" 
+        ref={printableAreaRef} 
+        className="absolute -left-[9999px] top-auto w-[794px] p-10 bg-white text-black" /* Increased padding for visual margin in canvas */
+      >
          <div
-            className="markdown-preview"
+            className="markdown-preview" /* This class applies prose styles */
             dangerouslySetInnerHTML={{ __html: htmlContent }}
           />
       </div>
     </div>
   );
 }
+
