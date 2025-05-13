@@ -1,5 +1,7 @@
+
 import Link from 'next/link';
 import { FileText } from 'lucide-react';
+import { ThemeToggle } from '@/components/theme-toggle';
 
 export function Header() {
   return (
@@ -9,7 +11,7 @@ export function Header() {
           <FileText className="h-8 w-8" />
           <span>Mark2PDF</span>
         </Link>
-        {/* Future navigation links can go here */}
+        <ThemeToggle />
       </div>
     </header>
   );
