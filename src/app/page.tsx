@@ -1,3 +1,4 @@
+
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
@@ -12,6 +13,7 @@ import { Download, Eye } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { useToast } from "@/hooks/use-toast";
+import GoogleAd from '@/components/ads/GoogleAd'; // Import the GoogleAd component
 
 const DEFAULT_MARKDOWN = `# Mark2PDF Demo
 
@@ -50,6 +52,9 @@ export default function Home() {
   const [htmlContent, setHtmlContent] = useState('');
   const { toast } = useToast();
   const printableAreaRef = useRef<HTMLDivElement>(null);
+
+  const adsenseClientId = process.env.NEXT_PUBLIC_ADSENSE_CLIENT_ID;
+  const adsenseSlotId1 = process.env.NEXT_PUBLIC_ADSENSE_SLOT_ID_1;
 
   useEffect(() => {
     const renderLaTeX = (content: string) => {
@@ -95,73 +100,72 @@ export default function Home() {
     });
 
     try {
-      // Log content of printable area before capturing
-      // console.log('Printable area innerHTML before h2c:', printableAreaRef.current.innerHTML);
-
       const canvas = await html2canvas(printableAreaRef.current, {
         scale: 2, 
         useCORS: true, 
         logging: process.env.NODE_ENV === 'development',
         backgroundColor: '#ffffff', // Ensure canvas background is white
         onclone: (clonedDoc) => {
+          const clonedPrintableArea = clonedDoc.getElementById('printableArea');
+          if (clonedPrintableArea) {
+            // Apply styles to make text black for PDF rendering for all elements within printableArea
+            const allElements = clonedPrintableArea.getElementsByTagName('*');
+            for (let i = 0; i < allElements.length; i++) {
+              (allElements[i] as HTMLElement).style.color = '#000000';
+            }
+          }
+
           const head = clonedDoc.head;
           if (head) {
-            // Copy <link rel="stylesheet"> elements from original document
             document.querySelectorAll('link[rel="stylesheet"]').forEach(linkEl => {
               const newLink = clonedDoc.createElement('link');
               newLink.rel = 'stylesheet';
-              // Ensure href is absolute or correctly resolved
               newLink.href = (linkEl as HTMLLinkElement).href; 
               head.appendChild(newLink);
             });
-            // Copy <style> elements from original document
             document.querySelectorAll('style').forEach(styleEl => {
               const newStyle = clonedDoc.createElement('style');
               newStyle.textContent = styleEl.textContent;
               head.appendChild(newStyle);
             });
-          } else {
-            console.warn('Cloned document has no head element.');
+             // Add specific KaTeX CSS to cloned document for html2canvas
+            const katexCSS = clonedDoc.createElement('link');
+            katexCSS.rel = 'stylesheet';
+            katexCSS.href = 'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css'; // Use CDN
+            katexCSS.integrity = 'sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV';
+            katexCSS.crossOrigin = 'anonymous';
+            head.appendChild(katexCSS);
           }
           
-          // console.log('Cloned document head:', clonedDoc.head.innerHTML);
-
-          // Wait for images in the cloned document
           const images = clonedDoc.getElementsByTagName('img');
-          const imagePromises = [];
+          const imagePromises: Promise<void>[] = [];
           for (let i = 0; i < images.length; i++) {
             if (!images[i].complete && images[i].src) {
-              imagePromises.push(new Promise((resolve, reject) => {
-                images[i].onload = resolve;
+              imagePromises.push(new Promise((resolve) => {
+                images[i].onload = () => resolve();
                 images[i].onerror = () => {
                   console.warn(`Cloned image failed to load: ${images[i].src}`);
-                  resolve(null); // Resolve even on error to not block PDF generation
+                  resolve(); 
                 };
-                // Add a timeout for image loading as a fallback
                 setTimeout(() => {
                     if (!images[i].complete) {
                         console.warn(`Cloned image timed out: ${images[i].src}`);
-                        resolve(null);
+                        resolve();
                     }
-                }, 5000); // 5 second timeout per image
+                }, 5000);
               }));
             }
           }
           return Promise.all(imagePromises).then(() => {
-            console.log('Stylesheet links, style tags, and images processed for cloned document.');
-            // Optional: small delay for fonts to render, this is a fallback
-            // return new Promise(resolve => setTimeout(resolve, 300));
-          }).catch(err => {
-            console.error('Error processing images in cloned document:', err);
+             // Small delay for styles and fonts to apply in the cloned document
+            return new Promise(resolve => setTimeout(resolve, 500));
           });
         },
       });
       
-      // console.log('Canvas generated, width:', canvas.width, 'height:', canvas.height);
       const imgData = canvas.toDataURL('image/png');
-      // console.log('Image data URL length:', imgData.length);
 
-      if (imgData.length < 1000) { // Arbitrary small length to detect blank/failed canvas
+      if (imgData.length < 1000) { 
           throw new Error('Generated image data seems too small, canvas might be blank.');
       }
 
@@ -192,10 +196,50 @@ export default function Home() {
       }
       
       const x = margin + (contentAreaWidth - pdfImgWidth) / 2;
-      const y = margin + (contentAreaHeight - pdfImgHeight) / 2;
+      // Calculate total pages if content is longer than one page
+      const totalPdfImgHeight = pdfImgHeight; // Height of the entire content as a single image
+      let currentY = margin; // Initial Y position for the first image chunk
+
+      if (totalPdfImgHeight <= contentAreaHeight) {
+        // Content fits on one page
+        pdf.addImage(imgData, 'PNG', x, currentY + (contentAreaHeight - pdfImgHeight) / 2, pdfImgWidth, pdfImgHeight, undefined, 'FAST');
+      } else {
+        // Content spans multiple pages
+        let remainingImgHeight = imgOriginalHeight;
+        let currentImgY = 0; // Y position within the original canvas image
+
+        while (remainingImgHeight > 0) {
+          // Calculate the height of the chunk to draw on the current PDF page
+          // The height on canvas corresponding to contentAreaHeight on PDF
+          const sourceChunkHeight = (contentAreaHeight / pdfImgWidth) * imgOriginalWidth / imgAspectRatio;
+          const actualChunkHeightOnCanvas = Math.min(remainingImgHeight, sourceChunkHeight);
+
+          // Create a temporary canvas for the chunk
+          const chunkCanvas = document.createElement('canvas');
+          chunkCanvas.width = imgOriginalWidth;
+          chunkCanvas.height = actualChunkHeightOnCanvas;
+          const chunkCtx = chunkCanvas.getContext('2d');
+          if (chunkCtx) {
+            chunkCtx.drawImage(canvas, 0, currentImgY, imgOriginalWidth, actualChunkHeightOnCanvas, 0, 0, imgOriginalWidth, actualChunkHeightOnCanvas);
+          }
+          const chunkImgData = chunkCanvas.toDataURL('image/png');
+          
+          // Calculate dimensions for this chunk on the PDF page
+          const chunkPdfImgHeight = (actualChunkHeightOnCanvas / imgOriginalWidth) * pdfImgWidth;
+          const chunkX = margin + (contentAreaWidth - pdfImgWidth) / 2;
+
+          pdf.addImage(chunkImgData, 'PNG', chunkX, currentY, pdfImgWidth, chunkPdfImgHeight, undefined, 'FAST');
+          
+          remainingImgHeight -= actualChunkHeightOnCanvas;
+          currentImgY += actualChunkHeightOnCanvas;
+
+          if (remainingImgHeight > 0) {
+            pdf.addPage();
+            currentY = margin; // Reset Y for new page
+          }
+        }
+      }
       
-      // console.log('Adding image to PDF at x:', x, 'y:', y, 'width:', pdfImgWidth, 'height:', pdfImgHeight);
-      pdf.addImage(imgData, 'PNG', x, y, pdfImgWidth, pdfImgHeight, undefined, 'FAST');
       pdf.save('mark2pdf_document.pdf');
       
       toast({
@@ -234,6 +278,21 @@ export default function Home() {
         </CardContent>
       </Card>
 
+      {/* Ad Unit Section */}
+      {adsenseClientId && adsenseSlotId1 && (
+        <div className="my-6 flex justify-center" aria-label="Advertisement Area">
+          <GoogleAd
+            client={adsenseClientId}
+            slot={adsenseSlotId1}
+            format="auto"
+            responsive="true"
+            className="w-full max-w-3xl bg-muted/50 flex items-center justify-center text-muted-foreground border border-dashed border-border rounded-md p-2"
+            style={{ minHeight: '90px', height: 'auto' }}
+          />
+        </div>
+      )}
+
+
       <div className="flex justify-center my-4">
         <Button 
           onClick={handleDownloadPDF} 
@@ -268,13 +327,11 @@ export default function Home() {
         </CardContent>
       </Card>
 
-      {/* Hidden div for PDF generation. Styled to match A4 paper aspect ratio at 96 DPI (794x1123px approx). */}
-      {/* Width is 794px. Height will be auto based on content. */}
-      {/* Ensure this div is in the DOM when handleDownloadPDF is called. */}
       <div 
         id="printableArea" 
         ref={printableAreaRef} 
         className="absolute -left-[9999px] top-auto w-[794px] p-10 bg-white text-black" 
+        style={{color: '#000000 !important'}} // Ensure base text is black for PDF
         aria-hidden="true" 
       >
          <div
